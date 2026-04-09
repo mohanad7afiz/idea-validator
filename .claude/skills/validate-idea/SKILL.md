@@ -30,7 +30,7 @@ Example:
 
 ### Step 1: Verify prerequisites
 
-Before doing anything, check all four prerequisites. If any fail, print the diagnostic and STOP — do not continue.
+Before doing anything, check ALL six prerequisites. If any fail, print the diagnostic and STOP — do not continue. There's no point running partial checks.
 
 ```bash
 # Check 1: mirofish CLI is on PATH
@@ -42,26 +42,64 @@ fi
 
 # Check 2: MiroFish backend is reachable at :5001
 HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" http://localhost:5001/api/graph/project/list 2>/dev/null || echo "000")
-if [ "$HTTP_CODE" = "000" ]; then
-  echo "❌ MiroFish backend is not running at http://localhost:5001"
-  echo "   Start it: cd ~/tools/mirofish && docker compose up -d"
+if [ "$HTTP_CODE" != "200" ]; then
+  echo "❌ MiroFish backend is not running at http://localhost:5001 (HTTP=$HTTP_CODE)"
+  echo "   Start it: cd ~/tools/mirofish && DOCKER_DEFAULT_PLATFORM=linux/amd64 docker compose up -d"
+  echo "   (The DOCKER_DEFAULT_PLATFORM env var is needed on Apple Silicon — MiroFish's image is amd64-only.)"
   exit 1
 fi
 
-# Check 3: Python has openpyxl
+# Check 3: MiroFish backend has a working LLM. The easiest way to tell is to make a
+# tiny throwaway ontology-generate call and look at the response. If it comes back
+# with a Zep or LLM auth error, we know the .env isn't configured.
+#
+# NOTE FOR THE USER: MiroFish needs both of these in ~/tools/mirofish/.env:
+#   - LLM_API_KEY / LLM_BASE_URL / LLM_MODEL_NAME pointing at an OpenAI-compatible
+#     endpoint (we recommend pointing at the local claude-proxy shim at
+#     http://host.docker.internal:4000/v1 — see below)
+#   - ZEP_API_KEY from https://app.getzep.com/ (the actual API KEY from their
+#     API Keys dashboard page, NOT the account UUID — Zep distinguishes between them
+#     and gives you a 401 if you use the account ID)
+
+# Check 4: claude-proxy shim is running on the host. MiroFish's LLM calls go through it.
+# The proxy wraps `claude -p` as an OpenAI-compatible endpoint so you can use your
+# Claude Code subscription instead of paying for a separate Anthropic API key.
+if ! curl -s -o /dev/null -w "%{http_code}" http://localhost:4000/healthz | grep -q 200; then
+  echo "❌ claude-proxy is not running at http://localhost:4000"
+  echo "   Start it: python3 ~/tools/claude-proxy/server.py --port 4000 &"
+  echo "   (Source: see the claude-proxy section at the bottom of this file.)"
+  exit 1
+fi
+
+# Check 5: Python has openpyxl (for reading the Excel workbook)
 if ! python3 -c "import openpyxl" 2>/dev/null; then
   echo "❌ Python module 'openpyxl' not installed."
   echo "   Install it: pip3 install openpyxl"
   exit 1
 fi
 
-# Check 4: Workbook file exists
+# Check 6: Workbook file exists
 WORKBOOK="$1"  # passed from the user's --workbook argument
 if [ ! -f "$WORKBOOK" ]; then
   echo "❌ Workbook not found: $WORKBOOK"
   exit 1
 fi
 ```
+
+**Known failure modes the above checks catch:**
+- mirofish-cli not installed
+- MiroFish Docker container not running OR booting (ontology/generate will time out)
+- MiroFish backend crashing on arm64 (Apple Silicon) without `DOCKER_DEFAULT_PLATFORM=linux/amd64`
+- Port 3000 held by another container (`personal-fin-web` or similar) — MiroFish will fail to start the frontend
+- Zep API key missing or invalid (graph_build will return 500 with a Zep 401 in the error)
+- LLM auth failure (ontology_generate returns 500 with provider-specific auth error)
+- claude-proxy shim not running (MiroFish will get a connection error on host.docker.internal:4000)
+
+**Known slow-but-not-broken behavior:**
+- First run's ontology generation takes ~2-3 minutes (5-6 sequential LLM calls through the proxy)
+- Report generation takes 20-60 minutes because the ReportAgent chains 20-30 LLM calls
+- Zep's graph search API has a 400-character query limit; MiroFish logs a warning and falls back to local search — this is fine, don't worry about it
+- MiroFish's internal prompts are hardcoded Chinese, so report output may be in Chinese even for English queries. The proxy's language override helps for direct calls but the ReportAgent's internal chain bypasses it
 
 ### Step 2: Read the workbook
 
